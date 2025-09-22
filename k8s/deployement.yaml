@@ -15,9 +15,9 @@ spec:
     spec:
       containers:
         - name: $APP_NAME
-          image: IMAGE_PLACEHOLDER # replaced by kubectl set image in workflows
+          image: IMAGE_PLACEHOLDER
           ports:
-            - containerPort: 3000 # adjust to your app
+            - containerPort: 80
           env:
             - name: NODE_ENV
               value: "production"
