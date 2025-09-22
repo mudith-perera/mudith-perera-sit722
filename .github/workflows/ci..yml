@@ -1,18 +1,17 @@
-name: CI - Test & Push to ACR (testing branch)
+name: CI - Test Python services & Push images to ACR
 
 on:
   push:
-    branches:
-      - testing
+    branches: [testing]
 
 env:
-  APP_NAME: ${{ vars.APP_NAME || 'sit722-app' }}
   AZ_LOCATION: ${{ vars.AZ_LOCATION || 'australiaeast' }}
-  PROD_ACR: ${{ vars.PROD_ACR }} # required (global unique)
+  PROD_RG: ${{ vars.PROD_RG || 'sit722-prod-rg' }}
+  PROD_ACR: ${{ vars.PROD_ACR }} # e.g., mudithacr722
   IMAGE_TAG: ${{ github.sha }}
 
 jobs:
-  build-test-push:
+  test-build-push:
     runs-on: ubuntu-latest
     permissions:
       id-token: write
@@ -22,59 +21,82 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ---- BUILD & TEST (adapt if not Node.js) ----
-      - name: Setup Node
-        uses: actions/setup-node@v4
+      # ---------- PYTHON TESTS (all 3 services) ----------
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          node-version: "20"
+          python-version: "3.11"
 
-      - name: Install deps
-        run: npm install
+      - name: Install & test product_service
+        working-directory: backend/product_service
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+          pytest -q
 
-      - name: Run tests
-        run: npm test
+      - name: Install & test order_service
+        working-directory: backend/order_service
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+          pytest -q
 
-      # ---- AZURE LOGIN ----
+      - name: Install & test customer_service
+        working-directory: backend/customer_service
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+          pytest -q
+
+      # ---------- AZURE LOGIN ----------
       - name: Azure Login
         uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      # ---- ENSURE ACR EXISTS (idempotent) ----
-      - name: Create/Ensure Resource Group for ACR
+      # Ensure RG & ACR exist (idempotent)
+      - name: Ensure RG & ACR
         run: |
-          az group create -n ${{ vars.PROD_RG || 'sit722-prod-rg' }} -l $AZ_LOCATION
-
-      - name: Create/Ensure ACR
-        run: |
-          if ! az acr show -n $PROD_ACR >/dev/null 2>&1; then
-            az acr create -n $PROD_ACR -g ${{ vars.PROD_RG || 'sit722-prod-rg' }} --sku Basic -l $AZ_LOCATION
+          az group create -n ${{ env.PROD_RG }} -l ${{ env.AZ_LOCATION }}
+          if ! az acr show -n ${{ env.PROD_ACR }} >/dev/null 2>&1; then
+            az acr create -n ${{ env.PROD_ACR }} -g ${{ env.PROD_RG }} --sku Basic -l ${{ env.AZ_LOCATION }}
           fi
-          az acr show -n $PROD_ACR --query "loginServer" -o tsv
+          echo "LOGIN_SERVER=$(az acr show -n ${{ env.PROD_ACR }} --query loginServer -o tsv)" >> $GITHUB_ENV
 
-      - name: ACR Login (docker)
+      - name: ACR login (docker)
+        run: az acr login -n ${{ env.PROD_ACR }}
+
+      # ---------- BUILD & PUSH ALL IMAGES ----------
+      - name: Build & push product_service
         run: |
-          az acr login -n $PROD_ACR
-          echo "LOGIN_SERVER=$(az acr show -n $PROD_ACR --query loginServer -o tsv)" >> $GITHUB_ENV
+          docker build -t $LOGIN_SERVER/product-service:${{ env.IMAGE_TAG }} backend/product_service
+          docker push $LOGIN_SERVER/product-service:${{ env.IMAGE_TAG }}
 
-      # ---- BUILD & PUSH IMAGE ----
-      - name: Build & Push
+      - name: Build & push order_service
         run: |
-          docker build -t $LOGIN_SERVER/${{ env.APP_NAME }}:${{ env.IMAGE_TAG }} .
-          docker push $LOGIN_SERVER/${{ env.APP_NAME }}:${{ env.IMAGE_TAG }}
+          docker build -t $LOGIN_SERVER/order-service:${{ env.IMAGE_TAG }} backend/order_service
+          docker push $LOGIN_SERVER/order-service:${{ env.IMAGE_TAG }}
 
-      # Optional: mark a "testing" tag for convenience
-      - name: Tag as :testing-latest
+      - name: Build & push customer_service
         run: |
-          docker tag $LOGIN_SERVER/${{ env.APP_NAME }}:${{ env.IMAGE_TAG }} $LOGIN_SERVER/${{ env.APP_NAME }}:testing-latest
-          docker push $LOGIN_SERVER/${{ env.APP_NAME }}:testing-latest
+          docker build -t $LOGIN_SERVER/customer-service:${{ env.IMAGE_TAG }} backend/customer_service
+          docker push $LOGIN_SERVER/customer-service:${{ env.IMAGE_TAG }}
 
-      # ---- Expose artifact with image info for the next workflow ----
-      - name: Write image reference
-        run: echo "$LOGIN_SERVER/${{ env.APP_NAME }}:${{ env.IMAGE_TAG }}" > image.txt
+      - name: Build & push frontend
+        run: |
+          docker build -t $LOGIN_SERVER/frontend:${{ env.IMAGE_TAG }} frontend
+          docker push $LOGIN_SERVER/frontend:${{ env.IMAGE_TAG }}
 
-      - name: Upload image artifact
+      # Provide image list to staging
+      - name: Write image refs
+        run: |
+          echo "$LOGIN_SERVER/product-service:${{ env.IMAGE_TAG }}"    >  images.txt
+          echo "$LOGIN_SERVER/order-service:${{ env.IMAGE_TAG }}"     >> images.txt
+          echo "$LOGIN_SERVER/customer-service:${{ env.IMAGE_TAG }}"  >> images.txt
+          echo "$LOGIN_SERVER/frontend:${{ env.IMAGE_TAG }}"          >> images.txt
+
+      - name: Upload artifact (image refs)
         uses: actions/upload-artifact@v4
         with:
-          name: image-ref
-          path: image.txt
+          name: image-refs
+          path: images.txt
