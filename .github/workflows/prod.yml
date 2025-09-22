@@ -2,8 +2,8 @@ name: PROD - Deploy to AKS (main branch)
 
 on:
   push:
-    branches: [master]
-    workflow_dispatch: {}
+    branches: [main] # 🔹 switched from master to main
+  workflow_dispatch: {}
 
 env:
   AZ_LOCATION: ${{ vars.AZ_LOCATION || 'australiaeast' }}
@@ -40,7 +40,10 @@ jobs:
       - name: Ensure AKS exists & attach ACR
         run: |
           if ! az aks show -g $PROD_RG -n $PROD_AKS >/dev/null 2>&1; then
-            az aks create -g $PROD_RG -n $PROD_AKS -l $AZ_LOCATION --node-count 1 --node-vm-size Standard_B2s --enable-managed-identity --attach-acr $PROD_ACR --generate-ssh-keys
+            az aks create -g $PROD_RG -n $PROD_AKS -l $AZ_LOCATION \
+              --node-count 1 --node-vm-size Standard_B2s \
+              --enable-managed-identity --attach-acr $PROD_ACR \
+              --generate-ssh-keys
           else
             az aks update -g $PROD_RG -n $PROD_AKS --attach-acr $PROD_ACR || true
           fi
@@ -48,6 +51,24 @@ jobs:
 
       - name: Create namespace
         run: kubectl create namespace $K8S_NAMESPACE --dry-run=client -o yaml | kubectl apply -f -
+
+      # 🔹 NEW: build & push all images for this commit
+      - name: Build & push product_service
+        run: |
+          docker build -t $LOGIN_SERVER/product-service:$IMAGE_TAG backend/product_service
+          docker push $LOGIN_SERVER/product-service:$IMAGE_TAG
+      - name: Build & push order_service
+        run: |
+          docker build -t $LOGIN_SERVER/order-service:$IMAGE_TAG backend/order_service
+          docker push $LOGIN_SERVER/order-service:$IMAGE_TAG
+      - name: Build & push customer_service
+        run: |
+          docker build -t $LOGIN_SERVER/customer-service:$IMAGE_TAG backend/customer_service
+          docker push $LOGIN_SERVER/customer-service:$IMAGE_TAG
+      - name: Build & push frontend
+        run: |
+          docker build -t $LOGIN_SERVER/frontend:$IMAGE_TAG frontend
+          docker push $LOGIN_SERVER/frontend:$IMAGE_TAG
 
       - name: Apply base manifests for each app
         run: |
