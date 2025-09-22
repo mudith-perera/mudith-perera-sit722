@@ -58,6 +58,12 @@ PRODUCT_SERVICE_HOST = os.getenv("PRODUCT_SERVICE_HOST", "localhost")
 PRODUCT_SERVICE_PORT = os.getenv("PRODUCT_SERVICE_PORT", "8001")
 PRODUCT_SERVICE_PATH = os.getenv("PRODUCT_SERVICE_PATH", "")
 
+# Normalize optional path and expose the URL constant the tests import
+if PRODUCT_SERVICE_PATH and not PRODUCT_SERVICE_PATH.startswith("/"):
+    PRODUCT_SERVICE_PATH = "/" + PRODUCT_SERVICE_PATH
+
+PRODUCT_SERVICE_URL = f"http://{PRODUCT_SERVICE_HOST}:{PRODUCT_SERVICE_PORT}{PRODUCT_SERVICE_PATH}"
+
 # --- FastAPI Application Setup ---
 app = FastAPI(
     title="Order Service API",
