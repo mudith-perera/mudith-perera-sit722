@@ -54,6 +54,10 @@ rabbitmq_connection: Optional[aio_pika.Connection] = None
 rabbitmq_channel: Optional[aio_pika.Channel] = None
 rabbitmq_exchange: Optional[aio_pika.Exchange] = None
 
+PRODUCT_SERVICE_HOST = os.getenv("PRODUCT_SERVICE_HOST", "localhost")
+PRODUCT_SERVICE_PORT = os.getenv("PRODUCT_SERVICE_PORT", "8001")
+PRODUCT_SERVICE_PATH = os.getenv("PRODUCT_SERVICE_PATH", "")
+
 # --- FastAPI Application Setup ---
 app = FastAPI(
     title="Order Service API",
