@@ -107,8 +107,37 @@ jobs:
 
       - name: Show frontend external IP
         run: |
+          echo "Checking for external IP..."
           for i in {1..20}; do
-            IP=$(kubectl -n $K8S_NAMESPACE get svc frontend -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
-            if [ -n "$IP" ]; then echo "Production External IP: http://$IP"; break; fi
-            echo "Waiting for external IP..."; sleep 15
+            echo "Attempt $i/20..."
+            
+            # Try multiple JSONPath queries to handle different cloud providers
+            IP=$(kubectl -n $K8S_NAMESPACE get svc frontend -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "")
+            
+            # If ip field is empty, try hostname field (for AWS ELB)
+            if [ -z "$IP" ]; then
+              IP=$(kubectl -n $K8S_NAMESPACE get svc frontend -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+            fi
+            
+            # Debug: Show the actual service status
+            echo "Service status:"
+            kubectl -n $K8S_NAMESPACE get svc frontend -o yaml | grep -A 10 "loadBalancer:"
+            
+            if [ -n "$IP" ] && [ "$IP" != "<none>" ]; then
+              echo "✅ Production External IP found: http://$IP"
+              echo "🌐 You can access your application at: http://$IP"
+              break
+            else
+              echo "⏳ External IP not ready yet, waiting..."
+              if [ $i -eq 20 ]; then
+                echo "❌ Timeout waiting for external IP. Please check manually:"
+                echo "   kubectl -n $K8S_NAMESPACE get svc frontend"
+              fi
+              sleep 15
+            fi
           done
+
+          # Show final service status regardless
+          echo ""
+          echo "Final service status:"
+          kubectl -n $K8S_NAMESPACE get svc frontend -o wide
