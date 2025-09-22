@@ -1,0 +1,80 @@
+name: CI - Test & Push to ACR (testing branch)
+
+on:
+  push:
+    branches:
+      - testing
+
+env:
+  APP_NAME: ${{ vars.APP_NAME || 'sit722-app' }}
+  AZ_LOCATION: ${{ vars.AZ_LOCATION || 'australiaeast' }}
+  PROD_ACR: ${{ vars.PROD_ACR }} # required (global unique)
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  build-test-push:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ---- BUILD & TEST (adapt if not Node.js) ----
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Run tests
+        run: npm test
+
+      # ---- AZURE LOGIN ----
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      # ---- ENSURE ACR EXISTS (idempotent) ----
+      - name: Create/Ensure Resource Group for ACR
+        run: |
+          az group create -n ${{ vars.PROD_RG || 'sit722-prod-rg' }} -l $AZ_LOCATION
+
+      - name: Create/Ensure ACR
+        run: |
+          if ! az acr show -n $PROD_ACR >/dev/null 2>&1; then
+            az acr create -n $PROD_ACR -g ${{ vars.PROD_RG || 'sit722-prod-rg' }} --sku Basic -l $AZ_LOCATION
+          fi
+          az acr show -n $PROD_ACR --query "loginServer" -o tsv
+
+      - name: ACR Login (docker)
+        run: |
+          az acr login -n $PROD_ACR
+          echo "LOGIN_SERVER=$(az acr show -n $PROD_ACR --query loginServer -o tsv)" >> $GITHUB_ENV
+
+      # ---- BUILD & PUSH IMAGE ----
+      - name: Build & Push
+        run: |
+          docker build -t $LOGIN_SERVER/${{ env.APP_NAME }}:${{ env.IMAGE_TAG }} .
+          docker push $LOGIN_SERVER/${{ env.APP_NAME }}:${{ env.IMAGE_TAG }}
+
+      # Optional: mark a "testing" tag for convenience
+      - name: Tag as :testing-latest
+        run: |
+          docker tag $LOGIN_SERVER/${{ env.APP_NAME }}:${{ env.IMAGE_TAG }} $LOGIN_SERVER/${{ env.APP_NAME }}:testing-latest
+          docker push $LOGIN_SERVER/${{ env.APP_NAME }}:testing-latest
+
+      # ---- Expose artifact with image info for the next workflow ----
+      - name: Write image reference
+        run: echo "$LOGIN_SERVER/${{ env.APP_NAME }}:${{ env.IMAGE_TAG }}" > image.txt
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-ref
+          path: image.txt

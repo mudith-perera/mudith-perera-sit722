@@ -1,0 +1,87 @@
+name: PROD - Deploy to AKS (main branch)
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  APP_NAME: ${{ vars.APP_NAME || 'sit722-app' }}
+  AZ_LOCATION: ${{ vars.AZ_LOCATION || 'australiaeast' }}
+  PROD_RG: ${{ vars.PROD_RG || 'sit722-prod-rg' }}
+  PROD_AKS: ${{ vars.PROD_AKS || 'sit722-prod-aks' }}
+  PROD_ACR: ${{ vars.PROD_ACR }}
+  K8S_NAMESPACE: ${{ vars.K8S_NAMESPACE || 'app' }}
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  deploy-prod:
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      # Ensure RG & ACR
+      - name: Ensure RG & ACR
+        run: |
+          az group create -n $PROD_RG -l $AZ_LOCATION
+          if ! az acr show -n $PROD_ACR >/dev/null 2>&1; then
+            az acr create -n $PROD_ACR -g $PROD_RG --sku Basic -l $AZ_LOCATION
+          fi
+          echo "LOGIN_SERVER=$(az acr show -n $PROD_ACR --query loginServer -o tsv)" >> $GITHUB_ENV
+
+      # Ensure AKS (prod) and ACR attach
+      - name: Ensure AKS exists (prod)
+        run: |
+          if ! az aks show -g $PROD_RG -n $PROD_AKS >/dev/null 2>&1; then
+            az aks create \
+              -g $PROD_RG \
+              -n $PROD_AKS \
+              -l $AZ_LOCATION \
+              --node-vm-size ${{ vars.AKS_NODE_SIZE || 'Standard_B2s' }} \
+              --node-count ${{ vars.AKS_NODE_COUNT || '1' }} \
+              --enable-managed-identity \
+              --attach-acr $PROD_ACR \
+              --generate-ssh-keys
+          else
+            # ensure ACR is attached
+            az aks update -g $PROD_RG -n $PROD_AKS --attach-acr $PROD_ACR || true
+          fi
+
+      - name: Get AKS credentials
+        run: az aks get-credentials -g $PROD_RG -n $PROD_AKS --overwrite-existing
+
+      - name: Create namespace (idempotent)
+        run: kubectl create namespace $K8S_NAMESPACE --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Apply manifests
+        run: |
+          sed "s/\$APP_NAME/${{ env.APP_NAME }}/g; s/\$K8S_NAMESPACE/${{ env.K8S_NAMESPACE }}/g" k8s/deployment.yaml | kubectl apply -f -
+          sed "s/\$APP_NAME/${{ env.APP_NAME }}/g; s/\$K8S_NAMESPACE/${{ env.K8S_NAMESPACE }}/g" k8s/service.yaml | kubectl apply -f -
+
+      - name: Set image to prod SHA
+        run: |
+          FULL_IMAGE="$LOGIN_SERVER/${{ env.APP_NAME }}:${{ env.IMAGE_TAG }}"
+          kubectl -n $K8S_NAMESPACE set image deployment/${{ env.APP_NAME }} ${{ env.APP_NAME }}=$FULL_IMAGE --record
+
+      - name: Wait for rollout
+        run: kubectl -n $K8S_NAMESPACE rollout status deployment/${{ env.APP_NAME }} --timeout=180s
+
+      - name: Output service endpoint
+        run: |
+          for i in {1..20}; do
+            IP=$(kubectl -n $K8S_NAMESPACE get svc ${{ env.APP_NAME }} -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+            if [ -n "$IP" ]; then echo "Production External IP: $IP"; break; fi
+            echo "Waiting for external IP..."
+            sleep 15
+          done

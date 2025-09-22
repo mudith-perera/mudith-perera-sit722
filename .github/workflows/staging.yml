@@ -1,0 +1,101 @@
+name: STAGING - Ephemeral AKS Deploy, Test, Destroy
+
+on:
+  workflow_run:
+    workflows: ["CI - Test & Push to ACR (testing branch)"]
+    types:
+      - completed
+
+env:
+  APP_NAME: ${{ vars.APP_NAME || 'sit722-app' }}
+  AZ_LOCATION: ${{ vars.AZ_LOCATION || 'australiaeast' }}
+  STAGING_RG_PREFIX: ${{ vars.STAGING_RG_PREFIX || 'sit722-stg' }}
+  K8S_NAMESPACE: ${{ vars.K8S_NAMESPACE || 'app' }}
+
+jobs:
+  deploy-staging:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Download image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: image-ref
+          path: .
+
+      - name: Read image
+        id: img
+        run: echo "FULL_IMAGE=$(cat image.txt)" >> $GITHUB_ENV
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Create staging RG (ephemeral)
+        id: mk_rg
+        run: |
+          RG="${{ env.STAGING_RG_PREFIX }}-$(date +%Y%m%d%H%M%S)"
+          echo "STAGING_RG=$RG" >> $GITHUB_ENV
+          az group create -n $RG -l $AZ_LOCATION
+
+      - name: Create AKS (ephemeral)
+        run: |
+          az aks create \
+            -g $STAGING_RG \
+            -n ${STAGING_RG}-aks \
+            -l $AZ_LOCATION \
+            --node-vm-size ${{ vars.AKS_NODE_SIZE || 'Standard_B2s' }} \
+            --node-count ${{ vars.AKS_NODE_COUNT || '1' }} \
+            --enable-managed-identity \
+            --generate-ssh-keys
+
+      - name: Get AKS credentials
+        run: |
+          az aks get-credentials -g $STAGING_RG -n ${STAGING_RG}-aks --overwrite-existing
+
+      - name: Create namespace (idempotent)
+        run: kubectl create namespace $K8S_NAMESPACE --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Apply K8s manifests
+        run: |
+          # We apply manifests with a placeholder; then set image below.
+          sed "s/\$APP_NAME/${{ env.APP_NAME }}/g; s/\$K8S_NAMESPACE/${{ env.K8S_NAMESPACE }}/g" k8s/deployment.yaml | kubectl apply -f -
+          sed "s/\$APP_NAME/${{ env.APP_NAME }}/g; s/\$K8S_NAMESPACE/${{ env.K8S_NAMESPACE }}/g" k8s/service.yaml | kubectl apply -f -
+
+      - name: Set image to CI-pushed image
+        run: |
+          kubectl -n $K8S_NAMESPACE set image deployment/${{ env.APP_NAME }} ${{ env.APP_NAME }}=${{ env.FULL_IMAGE }} --record
+
+      - name: Wait for rollout
+        run: kubectl -n $K8S_NAMESPACE rollout status deployment/${{ env.APP_NAME }} --timeout=180s
+
+      - name: Get Service External IP
+        id: svc
+        run: |
+          for i in {1..20}; do
+            IP=$(kubectl -n $K8S_NAMESPACE get svc ${{ env.APP_NAME }} -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+            if [ -n "$IP" ]; then echo "EXT_IP=$IP" >> $GITHUB_ENV; break; fi
+            echo "Waiting for external IP..."
+            sleep 15
+          done
+          test -n "$IP" || (echo "No external IP assigned" && exit 1)
+          echo "External IP: $IP"
+
+      - name: Smoke test (HTTP 200)
+        run: |
+          sleep 10
+          curl -fsS --max-time 10 http://$EXT_IP/ || (echo "Smoke test failed" && exit 1)
+
+      # ---- Always destroy the ephemeral staging RG ----
+      - name: Destroy staging RG
+        if: always()
+        run: |
+          az group delete -n $STAGING_RG --yes --no-wait
