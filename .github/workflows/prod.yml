@@ -2,7 +2,7 @@ name: PROD - Deploy to AKS (main branch)
 
 on:
   push:
-    branches: [master]
+    branches: [main] # switched from master -> main
   workflow_dispatch: {}
 
 env:
@@ -49,26 +49,41 @@ jobs:
           fi
           az aks get-credentials -g $PROD_RG -n $PROD_AKS --overwrite-existing
 
-      - name: Create namespace
-        run: kubectl create namespace $K8S_NAMESPACE --dry-run=client -o yaml | kubectl apply -f -
+      # 🔐 Ensure we can push to ACR
+      - name: ACR login (via Azure CLI)
+        run: |
+          az acr login -n $PROD_ACR
 
-      # 🔹 NEW: build & push all images for this commit
+      # (Optional, idempotent) make sure the SP has AcrPush on this registry
+      - name: Ensure SP has AcrPush on ACR
+        run: |
+          APP_ID=$(echo '${{ secrets.AZURE_CREDENTIALS }}' | jq -r '.clientId')
+          SCOPE=$(az acr show -n $PROD_ACR --query id -o tsv)
+          az role assignment create --assignee "$APP_ID" --role AcrPush --scope "$SCOPE" || true
+
+      # 🔹 Build & push all images for this commit
       - name: Build & push product_service
         run: |
           docker build -t $LOGIN_SERVER/product-service:$IMAGE_TAG backend/product_service
           docker push $LOGIN_SERVER/product-service:$IMAGE_TAG
+
       - name: Build & push order_service
         run: |
           docker build -t $LOGIN_SERVER/order-service:$IMAGE_TAG backend/order_service
           docker push $LOGIN_SERVER/order-service:$IMAGE_TAG
+
       - name: Build & push customer_service
         run: |
           docker build -t $LOGIN_SERVER/customer-service:$IMAGE_TAG backend/customer_service
           docker push $LOGIN_SERVER/customer-service:$IMAGE_TAG
+
       - name: Build & push frontend
         run: |
           docker build -t $LOGIN_SERVER/frontend:$IMAGE_TAG frontend
           docker push $LOGIN_SERVER/frontend:$IMAGE_TAG
+
+      - name: Create namespace
+        run: kubectl create namespace $K8S_NAMESPACE --dry-run=client -o yaml | kubectl apply -f -
 
       - name: Apply base manifests for each app
         run: |
