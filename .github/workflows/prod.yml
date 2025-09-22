@@ -1,0 +1,77 @@
+name: PROD - Deploy to AKS (main branch)
+
+on:
+  push:
+    branches: [main]
+
+env:
+  AZ_LOCATION: ${{ vars.AZ_LOCATION || 'australiaeast' }}
+  PROD_RG: ${{ vars.PROD_RG || 'sit722-prod-rg' }}
+  PROD_AKS: ${{ vars.PROD_AKS || 'sit722-prod-aks' }}
+  PROD_ACR: ${{ vars.PROD_ACR }}
+  K8S_NAMESPACE: ${{ vars.K8S_NAMESPACE || 'app' }}
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  prod-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Ensure RG & ACR
+        run: |
+          az group create -n $PROD_RG -l $AZ_LOCATION
+          if ! az acr show -n $PROD_ACR >/dev/null 2>&1; then
+            az acr create -n $PROD_ACR -g $PROD_RG --sku Basic -l $AZ_LOCATION
+          fi
+          echo "LOGIN_SERVER=$(az acr show -n $PROD_ACR --query loginServer -o tsv)" >> $GITHUB_ENV
+
+      - name: Ensure AKS exists & attach ACR
+        run: |
+          if ! az aks show -g $PROD_RG -n $PROD_AKS >/dev/null 2>&1; then
+            az aks create -g $PROD_RG -n $PROD_AKS -l $AZ_LOCATION --node-count 1 --node-vm-size Standard_B2s --enable-managed-identity --attach-acr $PROD_ACR --generate-ssh-keys
+          else
+            az aks update -g $PROD_RG -n $PROD_AKS --attach-acr $PROD_ACR || true
+          fi
+          az aks get-credentials -g $PROD_RG -n $PROD_AKS --overwrite-existing
+
+      - name: Create namespace
+        run: kubectl create namespace $K8S_NAMESPACE --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Apply base manifests for each app
+        run: |
+          for app in product-service order-service customer-service frontend; do
+            sed "s/\$APP_NAME/$app/g; s/\$K8S_NAMESPACE/$K8S_NAMESPACE/g" k8s/deployement.yaml | kubectl apply -f -
+            sed "s/\$APP_NAME/$app/g; s/\$K8S_NAMESPACE/$K8S_NAMESPACE/g" k8s/service.yaml     | kubectl apply -f -
+          done
+
+      - name: Set images (current commit)
+        run: |
+          kubectl -n $K8S_NAMESPACE set image deployment/product-service  product-service=$LOGIN_SERVER/product-service:$IMAGE_TAG --record
+          kubectl -n $K8S_NAMESPACE set image deployment/order-service    order-service=$LOGIN_SERVER/order-service:$IMAGE_TAG     --record
+          kubectl -n $K8S_NAMESPACE set image deployment/customer-service customer-service=$LOGIN_SERVER/customer-service:$IMAGE_TAG --record
+          kubectl -n $K8S_NAMESPACE set image deployment/frontend         frontend=$LOGIN_SERVER/frontend:$IMAGE_TAG               --record
+
+      - name: Wait for rollouts
+        run: |
+          for d in product-service order-service customer-service frontend; do
+            kubectl -n $K8S_NAMESPACE rollout status deployment/$d --timeout=300s
+          done
+
+      - name: Show frontend external IP
+        run: |
+          for i in {1..20}; do
+            IP=$(kubectl -n $K8S_NAMESPACE get svc frontend -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+            if [ -n "$IP" ]; then echo "Production External IP: http://$IP"; break; fi
+            echo "Waiting for external IP..."; sleep 15
+          done

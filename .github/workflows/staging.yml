@@ -1,0 +1,106 @@
+name: STAGING - Ephemeral AKS Deploy, Test, Destroy
+
+on:
+  workflow_run:
+    workflows: ["CI - Test Python services & Push images to ACR"]
+    types: [completed]
+
+env:
+  AZ_LOCATION: ${{ vars.AZ_LOCATION || 'australiaeast' }}
+  STAGING_RG_PREFIX: ${{ vars.STAGING_RG_PREFIX || 'sit722-stg' }}
+  K8S_NAMESPACE: ${{ vars.K8S_NAMESPACE || 'app' }}
+
+jobs:
+  staging:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Download image refs
+        uses: actions/download-artifact@v4
+        with:
+          name: image-refs
+          path: .
+
+      - name: Read images
+        id: imgs
+        run: |
+          mapfile -t arr < images.txt
+          echo "IMG_PRODUCT=${arr[0]}" >> $GITHUB_ENV
+          echo "IMG_ORDER=${arr[1]}"   >> $GITHUB_ENV
+          echo "IMG_CUSTOMER=${arr[2]}" >> $GITHUB_ENV
+          echo "IMG_FRONTEND=${arr[3]}" >> $GITHUB_ENV
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Create staging RG & AKS (ephemeral)
+        run: |
+          RG="${{ env.STAGING_RG_PREFIX }}-$(date +%Y%m%d%H%M%S)"
+          echo "STAGING_RG=$RG" >> $GITHUB_ENV
+          az group create -n $RG -l ${{ env.AZ_LOCATION }}
+          az aks create -g $RG -n ${RG}-aks -l ${{ env.AZ_LOCATION }} --node-count 1 --node-vm-size Standard_B2s --enable-managed-identity --generate-ssh-keys
+          az aks get-credentials -g $RG -n ${RG}-aks --overwrite-existing
+
+      - name: Create namespace
+        run: kubectl create namespace ${{ env.K8S_NAMESPACE }} --dry-run=client -o yaml | kubectl apply -f -
+
+      # --- Deploy simple placeholder workloads using your existing generic YAMLs ---
+      # We'll reuse your k8s/deployement.yaml & service.yaml by templating $APP_NAME
+      - name: Deploy product-service
+        run: |
+          sed "s/\$APP_NAME/product-service/g; s/\$K8S_NAMESPACE/${{ env.K8S_NAMESPACE }}/g" k8s/deployement.yaml | kubectl apply -f -
+          sed "s/\$APP_NAME/product-service/g; s/\$K8S_NAMESPACE/${{ env.K8S_NAMESPACE }}/g" k8s/service.yaml     | kubectl apply -f -
+          kubectl -n ${{ env.K8S_NAMESPACE }} set image deployment/product-service product-service=${{ env.IMG_PRODUCT }} --record
+
+      - name: Deploy order-service
+        run: |
+          sed "s/\$APP_NAME/order-service/g; s/\$K8S_NAMESPACE/${{ env.K8S_NAMESPACE }}/g" k8s/deployement.yaml | kubectl apply -f -
+          sed "s/\$APP_NAME/order-service/g; s/\$K8S_NAMESPACE/${{ env.K8S_NAMESPACE }}/g" k8s/service.yaml     | kubectl apply -f -
+          kubectl -n ${{ env.K8S_NAMESPACE }} set image deployment/order-service order-service=${{ env.IMG_ORDER }} --record
+
+      - name: Deploy customer-service
+        run: |
+          sed "s/\$APP_NAME/customer-service/g; s/\$K8S_NAMESPACE/${{ env.K8S_NAMESPACE }}/g" k8s/deployement.yaml | kubectl apply -f -
+          sed "s/\$APP_NAME/customer-service/g; s/\$K8S_NAMESPACE/${{ env.K8S_NAMESPACE }}/g" k8s/service.yaml     | kubectl apply -f -
+          kubectl -n ${{ env.K8S_NAMESPACE }} set image deployment/customer-service customer-service=${{ env.IMG_CUSTOMER }} --record
+
+      - name: Deploy frontend
+        run: |
+          sed "s/\$APP_NAME/frontend/g; s/\$K8S_NAMESPACE/${{ env.K8S_NAMESPACE }}/g" k8s/deployement.yaml | kubectl apply -f -
+          sed "s/\$APP_NAME/frontend/g; s/\$K8S_NAMESPACE/${{ env.K8S_NAMESPACE }}/g" k8s/service.yaml     | kubectl apply -f -
+          kubectl -n ${{ env.K8S_NAMESPACE }} set image deployment/frontend frontend=${{ env.IMG_FRONTEND }} --record
+
+      - name: Wait for rollouts
+        run: |
+          for d in product-service order-service customer-service frontend; do
+            kubectl -n ${{ env.K8S_NAMESPACE }} rollout status deployment/$d --timeout=240s
+          done
+
+      - name: Get frontend external IP
+        run: |
+          for i in {1..20}; do
+            IP=$(kubectl -n ${{ env.K8S_NAMESPACE }} get svc frontend -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+            if [ -n "$IP" ]; then echo "EXT_IP=$IP" >> $GITHUB_ENV; break; fi
+            echo "Waiting for external IP..."; sleep 15
+          done
+          test -n "$EXT_IP" || (echo "No external IP assigned" && exit 1)
+          echo "Frontend: http://$EXT_IP"
+
+      - name: Smoke test frontend
+        run: |
+          sleep 10
+          curl -fsS --max-time 10 http://$EXT_IP/ || (echo "Smoke test failed" && exit 1)
+
+      # Always destroy ephemeral staging RG (per brief)
+      - name: Destroy staging RG
+        if: always()
+        run: az group delete -n $STAGING_RG --yes --no-wait
