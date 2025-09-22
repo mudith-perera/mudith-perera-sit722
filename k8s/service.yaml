@@ -9,4 +9,4 @@ spec:
     app: $APP_NAME
   ports:
     - port: 80
-      targetPort: 3000 # match your app port
+      targetPort: 3000 # match your app por
